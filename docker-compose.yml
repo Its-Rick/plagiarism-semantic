@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  db:
+    image: ankane/pgvector
+    container_name: plagiarism_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: plagiarism
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    container_name: plagiarism_api
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:password@db:5432/plagiarism
+
+volumes:
+  pgdata:
