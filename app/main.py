@@ -5,7 +5,7 @@ from app.schemas import AssignmentRequest
 from app.models import Assignment, Sentence
 from app.services.embedding_service import generate_embeddings
 from app.services.plagiarism_service import check_plagiarism
-from app.utils import split_sentences
+from app.utils.text_utils import split_sentences
 
 Base.metadata.create_all(bind=engine)
 
