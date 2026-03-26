@@ -4,14 +4,14 @@ import * as mammoth from "mammoth";
 import {
   signUpEmail, loginEmail, loginGoogle,
   handleGoogleCallback, setGoogleRole,
-  getStoredUser, logout,
+  getStoredUser, logout, getValidToken,
 } from "./auth";
 import { supabase } from "./supabaseClient";
-import { getValidToken } from "./auth";  
+
 
 // ─── API helper ───────────────────────────────────────────────────────────────
 async function api(path, options = {}) {
-  const token = await getValidToken();   // ← was: localStorage.getItem("access_token")
+  const token = await getValidToken();
   const res = await fetch(`/api${path}`, {
     ...options,
     headers: {
@@ -23,7 +23,7 @@ async function api(path, options = {}) {
   const contentType = res.headers.get("content-type") || "";
   if (contentType.includes("text/html")) throw new Error(`Route /api${path} not found on server`);
   if (res.status === 401) {
-    // Token truly expired — force logout and re-login
+    // Token truly dead — clear everything and reload to login screen
     localStorage.removeItem("access_token");
     localStorage.removeItem("user");
     window.location.reload();
@@ -237,6 +237,252 @@ function AuthScreen({ onLogin }) {
           </svg>
           Continue with Google
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── ANALYTICS TAB ───────────────────────────────────────────────────────────
+function AnalyticsTab({ assignments, submissions, barData }) {
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null);
+  const [pairs, setPairs]         = useState([]);
+  const [pairsMeta, setPairsMeta] = useState(null);
+  const [pairsLoading, setPairsLoading] = useState(false);
+  const [expandedPair, setExpandedPair] = useState(null);
+
+  const loadPairs = async (assignmentId) => {
+    if (selectedAssignmentId === assignmentId) {
+      setSelectedAssignmentId(null); setPairs([]); setPairsMeta(null);
+      return;
+    }
+    setSelectedAssignmentId(assignmentId);
+    setPairsLoading(true);
+    try {
+      const data = await api(`/assignments/${assignmentId}/similarity-pairs`);
+      setPairs(data.pairs || []);
+      setPairsMeta(data);
+    } catch (e) {
+      setPairs([]);
+    }
+    setPairsLoading(false);
+  };
+
+  const card = { background: "rgba(15,23,42,0.8)", border: "1px solid #1e293b", borderRadius: 16, padding: 24, marginBottom: 20 };
+
+  const riskColor = (sim) => {
+    if (sim >= 75) return "#ef4444";
+    if (sim >= 50) return "#f97316";
+    if (sim >= 25) return "#f59e0b";
+    return "#22c55e";
+  };
+  const riskLabel = (sim) => {
+    if (sim >= 75) return "High Risk";
+    if (sim >= 50) return "Suspicious";
+    if (sim >= 25) return "Low Risk";
+    return "Similar";
+  };
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>Analytics</h1>
+      <p style={{ color: "#64748b", fontSize: 14, marginBottom: 24 }}>
+        Overview charts and per-assignment student similarity pairs
+      </p>
+
+      {/* ── Bar chart ── */}
+      <div style={card}>
+        <h3 style={{ margin: "0 0 20px", fontSize: 15, fontWeight: 600, color: "#94a3b8" }}>
+          Avg Plagiarism by Assignment (checked submissions only)
+        </h3>
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={barData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+            <XAxis dataKey="name" tick={{ fill: "#64748b", fontSize: 11 }} />
+            <YAxis tick={{ fill: "#64748b", fontSize: 11 }} domain={[0, 100]} />
+            <Tooltip
+              contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, color: "#e2e8f0" }}
+              formatter={v => [`${v}%`, "Avg Score"]}
+            />
+            <Bar dataKey="avg" radius={[6, 6, 0, 0]}>
+              {barData.map((d, i) => <Cell key={i} fill={getScoreColor(d.avg)} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ── Similarity pairs section ── */}
+      <div style={card}>
+        <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 600, color: "#94a3b8" }}>
+          Student Similarity Pairs
+        </h3>
+        <p style={{ color: "#475569", fontSize: 13, marginBottom: 16 }}>
+          Click an assignment to see which students have similar submissions.
+        </p>
+
+        {/* Assignment selector */}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+          {assignments.map(a => {
+            const checked = submissions.filter(s => s.assignment_id === a.id && s.plagiarism_percentage !== null).length;
+            const isSelected = selectedAssignmentId === a.id;
+            return (
+              <button key={a.id} onClick={() => loadPairs(a.id)}
+                style={{
+                  padding: "8px 16px", borderRadius: 10, cursor: "pointer",
+                  fontFamily: "'DM Sans', sans-serif", fontSize: 13, fontWeight: 600,
+                  border: isSelected ? "1px solid #6366f1" : "1px solid #1e293b",
+                  background: isSelected ? "rgba(99,102,241,0.15)" : "#0f172a",
+                  color: isSelected ? "#a5b4fc" : "#64748b",
+                  transition: "all 0.2s",
+                }}>
+                #{a.id} {a.title.split(" ").slice(0,3).join(" ")}
+                {checked > 0 && (
+                  <span style={{ marginLeft: 6, fontSize: 11, color: "#475569" }}>({checked} checked)</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Pairs results */}
+        {pairsLoading && (
+          <div style={{ textAlign: "center", padding: 40, color: "#64748b" }}>
+            Loading similarity pairs…
+          </div>
+        )}
+
+        {!pairsLoading && selectedAssignmentId && pairs.length === 0 && (
+          <div style={{ textAlign: "center", padding: 40, color: "#475569", background: "#0a111e", borderRadius: 12 }}>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>No similar pairs found</div>
+            <div style={{ fontSize: 13 }}>No submissions scored above the similarity threshold.</div>
+          </div>
+        )}
+
+        {!pairsLoading && pairsMeta && pairs.length > 0 && (
+          <div>
+            {/* Summary banner */}
+            <div style={{
+              display: "flex", gap: 16, marginBottom: 16, flexWrap: "wrap",
+            }}>
+              {[
+                { label: "Students checked", value: pairsMeta.total_students, color: "#6366f1" },
+                { label: "Similar pairs",    value: pairs.length,            color: "#f59e0b" },
+                { label: "High risk pairs",  value: pairs.filter(p => p.max_similarity >= 75).length, color: "#ef4444" },
+              ].map(s => (
+                <div key={s.label} style={{ background: "#0a111e", border: "1px solid #1e293b", borderRadius: 12, padding: "12px 20px", flex: 1, minWidth: 120 }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: s.color, fontFamily: "'Space Mono', monospace" }}>{s.value}</div>
+                  <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Pairs list */}
+            {pairs.map((pair, idx) => {
+              const isExpanded = expandedPair === idx;
+              const simColor = riskColor(pair.max_similarity);
+              return (
+                <div key={idx} style={{
+                  background: "#0a111e", border: `1px solid ${isExpanded ? simColor + "55" : "#1e293b"}`,
+                  borderRadius: 12, marginBottom: 10, overflow: "hidden",
+                  transition: "border-color 0.2s",
+                }}>
+                  {/* Pair header */}
+                  <div
+                    onClick={() => setExpandedPair(isExpanded ? null : idx)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 16, padding: "14px 18px",
+                      cursor: "pointer", userSelect: "none",
+                    }}
+                  >
+                    {/* Students */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1 }}>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ width: 38, height: 38, borderRadius: "50%", background: "linear-gradient(135deg, #6366f1, #8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "white", marginBottom: 2 }}>
+                          {pair.student_a % 100}
+                        </div>
+                        <div style={{ fontSize: 10, color: "#64748b" }}>Student {pair.student_a}</div>
+                        {pair.score_a !== null && pair.score_a !== undefined && (
+                          <div style={{ fontSize: 10, color: getScoreColor(pair.score_a), fontWeight: 600 }}>{pair.score_a.toFixed(1)}%</div>
+                        )}
+                      </div>
+
+                      <div style={{ flex: 1, textAlign: "center" }}>
+                        <div style={{ color: "#475569", fontSize: 18, marginBottom: 4 }}>⟷</div>
+                        {/* Similarity bar */}
+                        <div style={{ background: "#1e293b", borderRadius: 4, height: 6, width: "100%", overflow: "hidden" }}>
+                          <div style={{ width: `${pair.max_similarity}%`, height: "100%", background: simColor, borderRadius: 4, transition: "width 0.5s ease" }} />
+                        </div>
+                        <div style={{ fontSize: 11, color: "#475569", marginTop: 3 }}>
+                          {pair.match_count} matching sentence{pair.match_count !== 1 ? "s" : ""}
+                        </div>
+                      </div>
+
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ width: 38, height: 38, borderRadius: "50%", background: "linear-gradient(135deg, #22c55e, #16a34a)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "white", marginBottom: 2 }}>
+                          {pair.student_b % 100}
+                        </div>
+                        <div style={{ fontSize: 10, color: "#64748b" }}>Student {pair.student_b}</div>
+                        {pair.score_b !== null && pair.score_b !== undefined && (
+                          <div style={{ fontSize: 10, color: getScoreColor(pair.score_b), fontWeight: 600 }}>{pair.score_b.toFixed(1)}%</div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Max similarity badge */}
+                    <div style={{ textAlign: "right", minWidth: 90 }}>
+                      <div style={{ fontSize: 22, fontWeight: 700, color: simColor, fontFamily: "'Space Mono', monospace" }}>
+                        {pair.max_similarity}%
+                      </div>
+                      <div style={{ fontSize: 11, color: simColor, fontWeight: 600 }}>{riskLabel(pair.max_similarity)}</div>
+                    </div>
+
+                    <div style={{ color: "#475569", fontSize: 14, marginLeft: 8 }}>{isExpanded ? "▲" : "▼"}</div>
+                  </div>
+
+                  {/* Expanded: matched sentences */}
+                  {isExpanded && (
+                    <div style={{ borderTop: "1px solid #1e293b", padding: "14px 18px" }}>
+                      <div style={{ fontSize: 12, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+                        Matched Sentence Examples
+                      </div>
+                      {pair.examples.length === 0 ? (
+                        <div style={{ color: "#475569", fontSize: 13 }}>No example sentences available.</div>
+                      ) : pair.examples.map((ex, ei) => (
+                        <div key={ei} style={{ marginBottom: 12, background: "#050a14", borderRadius: 10, padding: 14, border: "1px solid #1e293b" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                            <span style={{ fontSize: 11, color: "#64748b", fontWeight: 600 }}>Match #{ei + 1}</span>
+                            <span style={{ fontSize: 12, color: simColor, fontWeight: 700 }}>{ex.similarity}% similar</span>
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                            <div>
+                              <div style={{ fontSize: 10, color: "#6366f1", fontWeight: 600, marginBottom: 4, textTransform: "uppercase" }}>Student {pair.student_a}</div>
+                              <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.5, background: "rgba(99,102,241,0.05)", borderRadius: 8, padding: "8px 10px", border: "1px solid rgba(99,102,241,0.15)" }}>
+                                "{ex.input_sentence}"
+                              </div>
+                            </div>
+                            <div>
+                              <div style={{ fontSize: 10, color: "#22c55e", fontWeight: 600, marginBottom: 4, textTransform: "uppercase" }}>Student {pair.student_b}</div>
+                              <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.5, background: "rgba(34,197,94,0.05)", borderRadius: 8, padding: "8px 10px", border: "1px solid rgba(34,197,94,0.15)" }}>
+                                "{ex.matched_sentence}"
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {!selectedAssignmentId && (
+          <div style={{ textAlign: "center", padding: 40, color: "#475569", background: "#0a111e", borderRadius: 12 }}>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>👆</div>
+            <div style={{ fontSize: 14 }}>Select an assignment above to view student similarity pairs</div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -523,23 +769,11 @@ function TeacherDashboard({ user, onLogout }) {
 
         {/* ── Analytics ── */}
         {!loading && tab === "analytics" && (
-          <div>
-            <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 24 }}>Analytics</h1>
-            <div style={styles.card}>
-              <h3 style={{ margin: "0 0 20px", fontSize: 15, fontWeight: 600, color: "#94a3b8" }}>Avg Plagiarism by Assignment (checked submissions only)</h3>
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={barData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                  <XAxis dataKey="name" tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <YAxis tick={{ fill: "#64748b", fontSize: 11 }} domain={[0, 100]} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, color: "#e2e8f0" }} formatter={v => [`${v}%`, "Avg Score"]} />
-                  <Bar dataKey="avg" radius={[6, 6, 0, 0]}>
-                    {barData.map((d, i) => <Cell key={i} fill={getScoreColor(d.avg)} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
+          <AnalyticsTab
+            assignments={assignments}
+            submissions={submissions}
+            barData={barData}
+          />
         )}
       </div>
     </div>
@@ -870,6 +1104,13 @@ function useApp() {
   const [loading, setLoading]       = useState(true);
 
   useEffect(() => {
+    // Keep localStorage token in sync whenever Supabase silently refreshes it
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session?.access_token) {
+        localStorage.setItem("access_token", session.access_token);
+      }
+    });
+
     (async () => {
       if (window.location.pathname === "/auth/callback") {
         const result = await handleGoogleCallback();
@@ -882,13 +1123,9 @@ function useApp() {
       const stored = getStoredUser();
       if (stored) setUser(stored);
       setLoading(false);
-    
-      supabase.auth.onAuthStateChange((event, session) => {
-  if (session?.access_token) {
-    localStorage.setItem("access_token", session.access_token);
-  }
-});
     })();
+
+    return () => subscription.unsubscribe();
   }, []);
 
   const handleLogin    = (u)    => setUser(u);

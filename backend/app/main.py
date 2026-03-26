@@ -37,6 +37,8 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api")
 
 
+
+
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 
 class AssignmentCreate(BaseModel):
@@ -382,6 +384,105 @@ def get_submission_detail(
             for m in matches
         ],
     }
+
+
+# ── Similarity pairs endpoint ─────────────────────────────────────────────────
+
+@app.get("/api/assignments/{assignment_id}/similarity-pairs")
+def get_similarity_pairs(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    teacher=Depends(require_teacher),
+):
+    """
+    Returns all student pairs that share at least one matched sentence,
+    grouped by pair, with their max similarity and matched sentences.
+    """
+    assignment = db.query(Assignment).filter(Assignment.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(404, "Assignment not found")
+
+    # Get all submissions for this assignment that have been checked
+    subs = db.query(Submission).filter(
+        Submission.assignment_id == assignment_id,
+        Submission.plagiarism_percentage != None,
+    ).all()
+
+    if not subs:
+        return {"assignment_id": assignment_id, "pairs": []}
+
+    sub_map = {s.id: s for s in subs}
+
+    # Collect all matches across all submissions
+    sub_ids = [s.id for s in subs]
+    all_matches = db.query(Match).filter(Match.submission_id.in_(sub_ids)).all()
+
+    # Build pairs: {(student_a, student_b) -> {max_sim, examples, sub_ids}}
+    pairs: dict = {}
+    for m in all_matches:
+        sub = sub_map.get(m.submission_id)
+        if not sub:
+            continue
+        student_a = sub.student_id
+        student_b = m.student_id
+        if student_a == student_b:
+            continue
+
+        # Normalise pair key so (a,b) and (b,a) are the same
+        key = (min(student_a, student_b), max(student_a, student_b))
+        sub_a = m.submission_id
+        # Find submission id for student_b
+        sub_b_obj = next((s for s in subs if s.student_id == student_b), None)
+        sub_b = sub_b_obj.id if sub_b_obj else None
+
+        if key not in pairs:
+            pairs[key] = {
+                "student_a": key[0],
+                "student_b": key[1],
+                "submission_a": sub_a if student_a == key[0] else sub_b,
+                "submission_b": sub_b if student_b == key[1] else sub_a,
+                "max_similarity": 0.0,
+                "match_count": 0,
+                "examples": [],
+            }
+
+        pairs[key]["match_count"] += 1
+        if m.similarity > pairs[key]["max_similarity"]:
+            pairs[key]["max_similarity"] = m.similarity
+        if len(pairs[key]["examples"]) < 3:
+            pairs[key]["examples"].append({
+                "input_sentence":   m.input_sentence,
+                "matched_sentence": m.matched_sentence,
+                "similarity":       round(m.similarity * 100, 1),
+            })
+
+    # Also include plagiarism percentages per student
+    student_scores = {
+        s.student_id: {
+            "submission_id":         s.id,
+            "plagiarism_percentage": s.plagiarism_percentage,
+        }
+        for s in subs
+    }
+
+    result = sorted(
+        pairs.values(),
+        key=lambda p: p["max_similarity"],
+        reverse=True,
+    )
+    for p in result:
+        p["max_similarity"] = round(p["max_similarity"] * 100, 1)
+        p["score_a"] = student_scores.get(p["student_a"], {}).get("plagiarism_percentage")
+        p["score_b"] = student_scores.get(p["student_b"], {}).get("plagiarism_percentage")
+
+    return {
+        "assignment_id":   assignment_id,
+        "assignment_title": assignment.title,
+        "total_students":  len(subs),
+        "pairs":           result,
+    }
+
+    
 
 
 # ── Serve React frontend (catch-all — MUST be last) ───────────────────────────

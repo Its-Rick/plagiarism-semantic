@@ -46,36 +46,43 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
     if data.role not in ("teacher", "student"):
         raise HTTPException(400, "role must be 'teacher' or 'student'")
 
+    # Check if user already exists in our DB first
+    existing = db.query(User).filter(User.email == data.email).first()
+    if existing:
+        # Already in our DB — just return success, don't touch Supabase
+        return {"message": "Account ready", "uid": existing.supabase_uid}
+
+    # Try to create in Supabase — may already exist there too
     anon_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    uid = None
 
     try:
         res = anon_client.auth.sign_up({
             "email": data.email,
             "password": data.password,
-            "options": {
-                "data": {"role": data.role}
-            }
+            "options": {"data": {"role": data.role}}
         })
-    except Exception as e:
-        raise HTTPException(400, str(e))
+        if res.user:
+            uid = res.user.id
+    except Exception:
+        pass  # Already exists in Supabase — fetch uid below
 
-    if not res.user:
-        raise HTTPException(400, "Signup failed")
+    # If Supabase signup failed (already registered), get uid via sign_in
+    if not uid:
+        try:
+            res = supa.auth.sign_in_with_password({
+                "email": data.email,
+                "password": data.password,
+            })
+            uid = res.user.id
+        except Exception:
+            raise HTTPException(400, "Could not retrieve account. Check your password.")
 
-    uid = res.user.id
-
-    # ── UPSERT instead of insert — handles duplicate calls gracefully ──
-    existing = db.query(User).filter(User.email == data.email).first()
-    if existing:
-        # Update supabase_uid in case it changed
-        existing.supabase_uid = uid
-        existing.role = data.role
-    else:
-        db.add(User(supabase_uid=uid, email=data.email, role=data.role))
+    # Save to our DB
+    db.add(User(supabase_uid=uid, email=data.email, role=data.role))
     db.commit()
 
     return {"message": "Account created", "uid": uid}
-
 # ── Email / password login (returns Supabase JWT) ────────────────────────────
 
 @router.post("/login")
