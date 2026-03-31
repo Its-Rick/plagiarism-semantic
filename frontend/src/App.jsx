@@ -7,6 +7,8 @@ import {
   getStoredUser, logout, getValidToken,
 } from "./auth";
 import { supabase } from "./supabaseClient";
+import { highlightPlagiarism, injectHighlightStyles } from "./AcademicHighlighter";
+import AcademicCheckPanel from "./AcademicCheckPanel"
 
 
 // ─── API helper ───────────────────────────────────────────────────────────────
@@ -943,7 +945,7 @@ function StudentDashboard({ user, onLogout }) {
           </div>
         </div>
         <nav style={{ flex: 1, paddingTop: 12 }}>
-          {[["assignments","📋","Assignments"],["mywork","📝","My Submissions"]].map(([id,icon,label]) => (
+          {[["assignments","📋","Assignments"],["mywork","📝","My Submissions"],["academic","🎓","Academic Check"]].map(([id,icon,label]) => (
             <button key={id} onClick={() => setTab(id)} style={styles.navBtn(tab === id)}>{icon} {label}</button>
           ))}
         </nav>
@@ -1092,10 +1094,17 @@ function StudentDashboard({ user, onLogout }) {
             })}
           </div>
         )}
+
+        {!loading && tab === "academic" && (
+          <AcademicCheckPanel />
+        )}
+
+        
       </div>
     </div>
   );
 }
+
 
 // ─── ROOT APP ─────────────────────────────────────────────────────────────────
 function useApp() {

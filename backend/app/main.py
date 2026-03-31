@@ -19,6 +19,12 @@ from app.utils.text_utils import split_sentences
 from app.auth.router import router as auth_router
 from app.auth.dependencies import get_db, require_teacher, require_student, get_current_user
 
+from fastapi import BackgroundTasks
+from typing import Optional
+import asyncio
+
+from app.services.academic_plagiarism_service import check_academic_plagiarism, result_to_json
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="EduCheck API", docs_url="/api/docs")
@@ -494,3 +500,56 @@ if FRONTEND_DIR.exists():
     @app.get("/{full_path:path}", include_in_schema=False)
     def serve_frontend(full_path: str):
         return FileResponse(str(FRONTEND_DIR / "index.html"))
+    
+
+# ── Request schema ────────────────────────────────────────────────────────────
+ 
+class AcademicCheckRequest(BaseModel):
+    text:      str
+    threshold: Optional[float] = 0.75   # 0.0 – 1.0  (default 75%)
+ 
+ 
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+ 
+@app.post("/api/academic-check")
+async def academic_check(
+    data: AcademicCheckRequest,
+    user=Depends(get_current_user),      # any logged-in user can call this
+):
+    """
+    Turnitin-style check against academic papers.
+    Async — does NOT block the event loop.
+    Returns matched segments with source metadata.
+    """
+    if len(data.text.strip()) < 50:
+        raise HTTPException(400, "Text too short — minimum 50 characters")
+ 
+    if data.threshold < 0.5 or data.threshold > 1.0:
+        raise HTTPException(400, "Threshold must be between 0.5 and 1.0")
+ 
+    # Runs the async pipeline (Semantic Scholar + ArXiv concurrently)
+    result = await check_academic_plagiarism(
+        submission_text = data.text,
+        threshold       = data.threshold,
+    )
+ 
+    return result_to_json(result)
+ 
+ 
+# ── Optional: store results against a submission ──────────────────────────────
+ 
+@app.post("/api/submissions/{submission_id}/academic-check")
+async def academic_check_for_submission(
+    submission_id: int,
+    db: Session = Depends(get_db),
+    teacher=Depends(require_teacher),
+):
+    """
+    Run academic check on an already-stored submission (teacher only).
+    """
+    sub = db.query(Submission).filter(Submission.id == submission_id).first()
+    if not sub:
+        raise HTTPException(404, "Submission not found")
+ 
+    result = await check_academic_plagiarism(sub.text, threshold=0.75)
+    return result_to_json(result)
