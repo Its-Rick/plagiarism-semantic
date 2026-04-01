@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -23,7 +23,8 @@ from fastapi import BackgroundTasks
 from typing import Optional
 import asyncio
 
-from app.services.academic_plagiarism_service import check_academic_plagiarism, result_to_json
+from app.services.pipeline.academic_service import check_academic_plagiarism, result_to_json
+from app.services.pipeline.file_extractor import extract_text_from_upload
 
 Base.metadata.create_all(bind=engine)
 
@@ -536,6 +537,33 @@ async def academic_check(
     return result_to_json(result)
  
  
+
+# ── File upload endpoint: POST /api/academic-check/file ──────────────────────
+
+@app.post("/api/academic-check/file")
+async def academic_check_file(
+    file:      UploadFile = File(..., description="PDF, DOCX or TXT file"),
+    threshold: float      = Form(default=0.65, ge=0.5, le=1.0),
+    user=Depends(get_current_user),
+):
+    """
+    Academic plagiarism check from an uploaded file (.pdf, .docx, .txt).
+    Extracts text then runs the same 5-stage hybrid pipeline.
+
+    Form fields:
+      file      — uploaded file (required)
+      threshold — similarity threshold 0.5–1.0 (default 0.65)
+    """
+    text = await extract_text_from_upload(file)
+    result = await check_academic_plagiarism(
+        submission_text = text,
+        threshold       = threshold,
+    )
+    response = result_to_json(result)
+    response["filename"]   = file.filename
+    response["char_count"] = len(text)
+    return response
+
 # ── Optional: store results against a submission ──────────────────────────────
  
 @app.post("/api/submissions/{submission_id}/academic-check")
