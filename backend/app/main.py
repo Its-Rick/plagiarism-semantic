@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -14,16 +14,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.database import Base, engine, SessionLocal
 from app.models import Assignment, Submission, Sentence, Match, User
 from app.services.embedding_service import generate_embeddings
-from app.services.plagiarism_service import check_plagiarism
+# check_plagiarism no longer needed — batch checker uses vectorised global matrix
 from app.utils.text_utils import split_sentences
 from app.auth.router import router as auth_router
 from app.auth.dependencies import get_db, require_teacher, require_student, get_current_user
 
-from fastapi import BackgroundTasks
-from typing import Optional
 import asyncio
-
 from app.services.pipeline.academic_service import check_academic_plagiarism, result_to_json
+from app.services.pipeline.file_extractor import extract_text_from_upload
 
 Base.metadata.create_all(bind=engine)
 
@@ -41,8 +39,6 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix="/api")
-
-
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -63,57 +59,196 @@ class SubmissionCreate(BaseModel):
 # ── Background plagiarism checker ─────────────────────────────────────────────
 
 def run_plagiarism_for_assignment(assignment_id: int):
-    """Runs after deadline — checks ALL submissions for an assignment at once."""
+    """
+    Fast batch plagiarism check — vectorised global matrix approach.
+
+    OLD approach (slow):
+      For each student:
+        - Re-query DB for all other sentences
+        - Compute similarity vs reference corpus
+        - Commit after every student
+      → O(k) DB round-trips, O(k²·n·d) similarity ops
+
+    NEW approach (fast):
+      1. ONE query: load ALL sentences for the assignment
+      2. Build global embedding matrix E ∈ ℝ^(total_sentences × 384)
+      3. Compute FULL (total × total) similarity matrix in one numpy call
+      4. For each student, slice their rows vs other students' rows — O(1)
+      5. ONE bulk INSERT for all matches, ONE commit at the end
+      → 2 DB round-trips total, O(total² · d) similarity ops (BLAS-level)
+    """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    THRESHOLD = 0.85
+
     db = SessionLocal()
     try:
-        assignment = db.query(Assignment).filter(Assignment.id == assignment_id).first()
+        assignment = db.query(Assignment).filter(
+            Assignment.id == assignment_id
+        ).first()
         if not assignment or assignment.status == "checked":
             return
 
-        print(f"[SCHEDULER] Starting plagiarism check for assignment #{assignment_id}")
+        print(f"[BATCH] Starting fast batch check for assignment #{assignment_id}")
+        t_start = __import__("time").time()
+
         assignment.status = "closed"
         db.commit()
 
+        # ── Step 1: ONE query — load all submissions + sentences together ────
         submissions = db.query(Submission).filter(
             Submission.assignment_id == assignment_id
         ).all()
 
-        for submission in submissions:
-            sentences  = [s.sentence_text for s in submission.sentences]
-            embeddings = [s.embedding     for s in submission.sentences]
+        if not submissions:
+            assignment.status = "checked"
+            db.commit()
+            return
 
-            if not sentences:
-                submission.plagiarism_percentage = 0.0
-                submission.checked_at = datetime.now(timezone.utc)
-                db.commit()
+        # Build lookup: submission_id → Submission object
+        sub_map = {s.id: s for s in submissions}
+
+        # Load ALL sentences for this assignment in a single query
+        all_sentence_rows = (
+            db.query(Sentence)
+            .filter(Sentence.submission_id.in_(sub_map.keys()))
+            .all()
+        )
+
+        if not all_sentence_rows:
+            # No sentences at all — mark everything 0
+            now = datetime.now(timezone.utc)
+            for sub in submissions:
+                sub.plagiarism_percentage = 0.0
+                sub.checked_at = now
+            assignment.status = "checked"
+            db.commit()
+            return
+
+        # ── Step 2: Build global embedding matrix in one numpy stack ─────────
+        # Group sentences by submission
+        from collections import defaultdict
+        sub_sentences: dict[int, list] = defaultdict(list)   # sub_id → [Sentence]
+        for row in all_sentence_rows:
+            sub_sentences[row.submission_id].append(row)
+
+        # Build index arrays for fast slicing
+        # global_index[i] = (submission_id, sentence_position, student_id, sentence_text)
+        global_texts:   list[str]   = []
+        global_sub_ids: list[int]   = []
+        global_stu_ids: list[int]   = []
+        global_embs:    list        = []
+
+        # Track per-submission slice: sub_id → (start_idx, end_idx)
+        sub_slices: dict[int, tuple[int, int]] = {}
+
+        cursor = 0
+        for sub_id, rows in sub_sentences.items():
+            sub_slices[sub_id] = (cursor, cursor + len(rows))
+            for r in rows:
+                global_texts.append(r.sentence_text)
+                global_sub_ids.append(sub_id)
+                global_stu_ids.append(r.student_id)
+                global_embs.append(r.embedding)
+            cursor += len(rows)
+
+        # Stack into a single matrix — shape: (total_sentences, 384)
+        E = np.array(global_embs, dtype=np.float32)
+
+        print(f"[BATCH]  Global matrix: {E.shape[0]} sentences × {E.shape[1]} dims")
+
+        # ── Step 3: ONE global similarity matrix ──────────────────────────────
+        # Shape: (total_sentences × total_sentences)
+        # Cosine similarity via normalised dot product — BLAS-level speed
+        norms = np.linalg.norm(E, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-9          # avoid div/zero
+        E_norm = E / norms
+        SIM = E_norm @ E_norm.T           # shape: (N, N)
+
+        print(f"[BATCH]  Similarity matrix computed: {SIM.shape}")
+
+        # ── Step 4: For each submission, slice its rows vs all OTHER rows ─────
+        now = datetime.now(timezone.utc)
+        all_sub_ids_set = set(sub_map.keys())
+
+        # Collect all matches to bulk-insert later
+        new_matches: list[dict] = []
+
+        # Clear stale matches for this assignment in ONE delete
+        db.query(Match).filter(
+            Match.submission_id.in_(list(all_sub_ids_set))
+        ).delete(synchronize_session=False)
+
+        for sub_id, sub in sub_map.items():
+            if sub_id not in sub_slices:
+                # No sentences — zero score
+                sub.plagiarism_percentage = 0.0
+                sub.checked_at = now
                 continue
 
-            plagiarism_pct, matches = check_plagiarism(
-                sentences, embeddings, assignment_id, submission.student_id
+            start, end = sub_slices[sub_id]
+            n_sentences = end - start
+
+            # Build a mask that zeros out same-student columns
+            # We don't want to compare a student against themselves
+            same_sub_mask = np.array(
+                [sid == sub_id for sid in global_sub_ids], dtype=bool
             )
 
-            submission.plagiarism_percentage = plagiarism_pct
-            submission.checked_at = datetime.now(timezone.utc)
-            db.commit()
+            # Slice rows for this submission: shape (n_sentences, N)
+            student_rows = SIM[start:end, :]          # this student's similarities
 
-            # Clear old matches, store new ones
-            db.query(Match).filter(Match.submission_id == submission.id).delete()
-            for m in matches:
-                db.add(Match(
-                    submission_id    = submission.id,
-                    input_sentence   = m["input_sentence"],
-                    matched_sentence = m["matched_sentence"],
-                    student_id       = m["student_id"],
-                    similarity       = m["final_similarity"],
-                ))
-            db.commit()
+            # Zero out self-comparisons
+            student_rows = student_rows.copy()
+            student_rows[:, same_sub_mask] = 0.0
+
+            # For each input sentence, find best match among OTHER students
+            best_col_idxs = np.argmax(student_rows, axis=1)   # shape: (n_sentences,)
+            best_scores   = student_rows[
+                np.arange(n_sentences), best_col_idxs
+            ]                                                   # shape: (n_sentences,)
+
+            # Count flagged sentences
+            flagged_mask = best_scores >= THRESHOLD
+            flagged_count = int(np.sum(flagged_mask))
+
+            pct = round((flagged_count / n_sentences) * 100, 2)
+            sub.plagiarism_percentage = pct
+            sub.checked_at = now
+
+            # Collect match rows for bulk insert
+            for local_i in np.where(flagged_mask)[0]:
+                global_i  = start + int(local_i)
+                global_j  = int(best_col_idxs[local_i])
+                sim_score = float(best_scores[local_i])
+
+                new_matches.append({
+                    "submission_id":    sub_id,
+                    "input_sentence":   global_texts[global_i],
+                    "matched_sentence": global_texts[global_j],
+                    "student_id":       global_stu_ids[global_j],
+                    "similarity":       sim_score,
+                })
+
+        # ── Step 5: ONE bulk insert for all matches ───────────────────────────
+        if new_matches:
+            db.bulk_insert_mappings(Match, new_matches)
 
         assignment.status = "checked"
         db.commit()
-        print(f"[SCHEDULER] Done — assignment #{assignment_id} fully checked")
+
+        elapsed = round(__import__("time").time() - t_start, 2)
+        print(
+            f"[BATCH] Done — assignment #{assignment_id} | "
+            f"{len(submissions)} students | "
+            f"{len(all_sentence_rows)} sentences | "
+            f"{len(new_matches)} matches | "
+            f"{elapsed}s"
+        )
 
     except Exception as e:
-        print(f"[SCHEDULER] Error on assignment #{assignment_id}: {e}")
+        print(f"[BATCH] Error on assignment #{assignment_id}: {e}")
         import traceback; traceback.print_exc()
     finally:
         db.close()
@@ -488,8 +623,76 @@ def get_similarity_pairs(
         "pairs":           result,
     }
 
-    
 
+
+
+# ── Academic Check: request schema ───────────────────────────────────────────
+
+class AcademicCheckRequest(BaseModel):
+    text:      str
+    threshold: Optional[float] = 0.65
+
+
+# ── POST /api/academic-check  (text) ─────────────────────────────────────────
+
+@app.post("/api/academic-check")
+async def academic_check(
+    data: AcademicCheckRequest,
+    user=Depends(get_current_user),
+):
+    """
+    Academic plagiarism check against arXiv, OpenAlex and GitHub.
+    5-stage hybrid pipeline: BM25 → Fingerprint → BERT → Hybrid score.
+    """
+    if len(data.text.strip()) < 50:
+        raise HTTPException(400, "Text too short — minimum 50 characters")
+    if not (0.5 <= data.threshold <= 1.0):
+        raise HTTPException(400, "Threshold must be between 0.5 and 1.0")
+
+    result = await check_academic_plagiarism(
+        submission_text = data.text.strip(),
+        threshold       = data.threshold,
+    )
+    return result_to_json(result)
+
+
+# ── POST /api/academic-check/file  (upload) ───────────────────────────────────
+
+@app.post("/api/academic-check/file")
+async def academic_check_file(
+    file:      UploadFile = File(..., description="PDF, DOCX or TXT file"),
+    threshold: float      = Form(default=0.65, ge=0.5, le=1.0),
+    user=Depends(get_current_user),
+):
+    """
+    Academic plagiarism check from an uploaded file (.pdf, .docx, .txt).
+    Extracts text then runs the same 5-stage hybrid pipeline.
+    """
+    text = await extract_text_from_upload(file)
+    result = await check_academic_plagiarism(
+        submission_text = text,
+        threshold       = threshold,
+    )
+    response = result_to_json(result)
+    response["filename"]   = file.filename
+    response["char_count"] = len(text)
+    return response
+
+
+# ── POST /api/submissions/{id}/academic-check  (teacher) ─────────────────────
+
+@app.post("/api/submissions/{submission_id}/academic-check")
+async def academic_check_for_submission(
+    submission_id: int,
+    db: Session = Depends(get_db),
+    teacher=Depends(require_teacher),
+):
+    """Run academic check on a stored submission (teacher only)."""
+    sub = db.query(Submission).filter(Submission.id == submission_id).first()
+    if not sub:
+        raise HTTPException(404, "Submission not found")
+    result = await check_academic_plagiarism(sub.text, threshold=0.65)
+    return result_to_json(result)
 
 # ── Serve React frontend (catch-all — MUST be last) ───────────────────────────
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend_dist"
@@ -500,59 +703,3 @@ if FRONTEND_DIR.exists():
     @app.get("/{full_path:path}", include_in_schema=False)
     def serve_frontend(full_path: str):
         return FileResponse(str(FRONTEND_DIR / "index.html"))
-    
-
-# ── Request schema ────────────────────────────────────────────────────────────
- 
-class AcademicCheckRequest(BaseModel):
-    text:      str
-    threshold: Optional[float] = 0.75   # 0.0 – 1.0  (default 75%)
- 
- 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
- 
-@app.post("/api/academic-check")
-async def academic_check(
-    data: AcademicCheckRequest,
-    user=Depends(get_current_user),      # any logged-in user can call this
-):
-    """
-    Turnitin-style check against academic papers.
-    Async — does NOT block the event loop.
-    Returns matched segments with source metadata.
-    """
-    if len(data.text.strip()) < 50:
-        raise HTTPException(400, "Text too short — minimum 50 characters")
- 
-    if data.threshold < 0.5 or data.threshold > 1.0:
-        raise HTTPException(400, "Threshold must be between 0.5 and 1.0")
- 
-    # Runs the async pipeline (Semantic Scholar + ArXiv concurrently)
-    result = await check_academic_plagiarism(
-        submission_text = data.text,
-        threshold       = data.threshold,
-    )
- 
-    return result_to_json(result)
-
-
-
- 
- 
-# ── Optional: store results against a submission ──────────────────────────────
- 
-@app.post("/api/submissions/{submission_id}/academic-check")
-async def academic_check_for_submission(
-    submission_id: int,
-    db: Session = Depends(get_db),
-    teacher=Depends(require_teacher),
-):
-    """
-    Run academic check on an already-stored submission (teacher only).
-    """
-    sub = db.query(Submission).filter(Submission.id == submission_id).first()
-    if not sub:
-        raise HTTPException(404, "Submission not found")
- 
-    result = await check_academic_plagiarism(sub.text, threshold=0.75)
-    return result_to_json(result)
