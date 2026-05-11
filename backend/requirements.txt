@@ -1,35 +1,21 @@
 # EduCheck — Backend Dependencies
 # Install with: pip install -r requirements.txt
-# ══════════════════════════════════════════════════════════════════════════════
-# EduCheck v2.0 — Backend Requirements
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Install all dependencies:
-#   pip install -r requirements.txt
-#
-# Python version: 3.10+  (3.11 / 3.12 / 3.13 also supported)
-#
-# ── Quick install groups ──────────────────────────────────────────────────────
-#   Core only (no AI):   pip install fastapi uvicorn sqlalchemy psycopg2-binary
-#   Full stack:          pip install -r requirements.txt
-#   With GPU BERT:       pip install torch --index-url https://download.pytorch.org/whl/cu118
-#                        (then run the rest of requirements.txt)
-# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ── Web Framework ─────────────────────────────────────────────────────────────
-
+# Core API framework
 fastapi>=0.110.0
-uvicorn[standard]>=0.29.0          # ASGI server with hot-reload support
-python-multipart>=0.0.9            # Required for UploadFile / multipart form data
+uvicorn[standard]>=0.29.0
 
+# Async HTTP (multi-source retrieval)
+aiohttp>=3.9.0
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# Embeddings via ONNX — replaces torch + sentence-transformers (~350MB RAM saved)
+onnxruntime>=1.18.0
+tokenizers>=0.19.0
+huggingface-hub>=0.23.0
 
-sqlalchemy>=2.0.0                  # ORM + query builder
-psycopg2-binary>=2.9.9             # PostgreSQL adapter (binary — no build required)
-pgvector>=0.2.5                    # pgvector SQLAlchemy integration (VECTOR column type)
-alembic>=1.13.0                    # Database migrations (optional but recommended)
+# Numerics
+numpy>=1.26.0
+scikit-learn>=1.4.0
 
 # FAISS — required by similarity_service.py
 faiss-cpu>=1.8.0
@@ -44,10 +30,8 @@ python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 supabase>=2.0.0
 
-# ── Authentication ────────────────────────────────────────────────────────────
-
-python-jose[cryptography]>=3.3.0   # JWT decode + RS256 verification
-supabase>=2.4.0                    # Supabase Python client (auth, storage)
+# Scheduling
+apscheduler>=3.10.0
 
 # File parsing — required by file_extractor.py
 python-multipart>=0.0.9
@@ -63,109 +47,3 @@ python-dotenv>=1.0.0
 
 # HTTP client
 httpx>=0.27.0
-
-# ── AI / NLP Core ────────────────────────────────────────────────────────────
-
-sentence-transformers>=2.7.0       # all-MiniLM-L6-v2 BERT sentence embeddings
-torch>=2.1.0                       # PyTorch backend for sentence-transformers
-                                   # CPU-only build (no CUDA) — ~700 MB
-                                   # For GPU: replace with torch+cuXXX wheel
-transformers>=4.40.0               # Hugging Face tokenizers (transitive dep)
-numpy>=1.26.0                      # Numerical arrays, matrix operations
-
-
-# ── Information Retrieval ─────────────────────────────────────────────────────
-
-rank-bm25>=0.2.2                   # BM25Okapi index for Stage 2 candidate pre-filtering
-scikit-learn>=1.4.0                # TF-IDF vectoriser (intra-assignment hybrid scoring)
-
-
-# ── Async HTTP (Multi-Source Retrieval) ───────────────────────────────────────
-
-aiohttp>=3.9.0                     # Async HTTP client for arXiv, OpenAlex, GitHub APIs
-
-
-# ── File Text Extraction ──────────────────────────────────────────────────────
-
-pdfplumber>=0.10.0                 # PDF text extraction (primary — better layout handling)
-pymupdf>=1.24.0                    # PDF extraction fallback + scanned PDF support
-                                   # (installs as 'fitz' module)
-python-docx>=1.1.0                 # DOCX paragraph + table cell extraction
-
-
-# ── NLP Utilities ────────────────────────────────────────────────────────────
-
-nltk>=3.8.1                        # Sentence tokenisation (punkt), stopwords
-                                   # First run: nltk.download('punkt')
-                                   #            nltk.download('punkt_tab')
-                                   #            nltk.download('stopwords')
-
-
-# ── Task Scheduling ───────────────────────────────────────────────────────────
-
-apscheduler>=3.10.4                # Deadline-triggered plagiarism jobs (DateTrigger)
-
-
-# ── Data Validation ───────────────────────────────────────────────────────────
-
-pydantic>=2.6.0                    # Request/response schema validation (FastAPI default)
-pydantic-settings>=2.2.0           # Settings management from .ENV files
-python-dotenv>=1.0.0               # Load .ENV file into environment
-
-
-# ── Security ─────────────────────────────────────────────────────────────────
-
-cryptography>=42.0.0               # Required by python-jose for RS256 JWT verification
-passlib[bcrypt]>=1.7.4             # Password hashing utilities (used by Supabase layer)
-
-
-# ── HTTP Utilities ────────────────────────────────────────────────────────────
-
-httpx>=0.27.0                      # Sync/async HTTP client (FastAPI test client + general use)
-requests>=2.31.0                   # Sync HTTP (fallback for some Supabase operations)
-
-
-# ── OPTIONAL: Vector Similarity Acceleration ──────────────────────────────────
-#
-# Uncomment to enable FAISS for approximate nearest-neighbour search.
-# Required when reference corpus exceeds ~100,000 sentences.
-# Provides sub-linear ANN search vs. brute-force cosine O(N·d).
-#
-# CPU-only (recommended for most deployments):
-# faiss-cpu>=1.8.0
-#
-# GPU variant (requires CUDA 11.x / 12.x):
-# faiss-gpu>=1.8.0
-
-
-# ── OPTIONAL: Development & Testing ──────────────────────────────────────────
-#
-# Uncomment for local development and running the test suite:
-#
-# pytest>=8.0.0                    # Test runner
-# pytest-asyncio>=0.23.0           # Async test support for pipeline tests
-# pytest-cov>=5.0.0                # Coverage reporting
-# black>=24.0.0                    # Code formatter
-# ruff>=0.4.0                      # Fast Python linter
-# mypy>=1.9.0                      # Static type checking
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NLTK DATA — run once after installation:
-#
-#   python -c "
-#   import nltk
-#   nltk.download('punkt')
-#   nltk.download('punkt_tab')
-#   nltk.download('stopwords')
-#   "
-#
-# FIRST-RUN MODEL DOWNLOAD — sentence-transformers downloads ~80 MB on first use:
-#   python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-#
-# KNOWN PLATFORM NOTES:
-#   Windows: psycopg2-binary works out of the box; no libpq needed
-#   macOS M1/M2: torch installs MPS-accelerated build automatically
-#   Linux (Railway/Render): all packages install without additional system deps
-#   Python 3.13: use pymupdf>=1.24.3 (earlier versions have C extension issues)
-# ══════════════════════════════════════════════════════════════════════════════
