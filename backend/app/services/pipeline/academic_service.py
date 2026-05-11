@@ -5,7 +5,7 @@ academic_service.py — EduCheck Multi-Source Academic Plagiarism Checker
   Stage 1 — Preprocessing      (utils.py)
   Stage 2 — Parallel retrieval (arXiv + OpenAlex + GitHub via asyncio)
   Stage 3 — Text processing    (split + clean retrieved content)
-  Stage 4 — Semantic similarity (all-MiniLM-L6-v2, sentence x sentence)
+  Stage 4 — Semantic similarity (all-MiniLM-L6-v2 via ONNX)
   Stage 5 — Scoring            (flagged / total x 100)
 """
 
@@ -21,18 +21,11 @@ from typing import List, Optional, Tuple
 
 import aiohttp
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from .utils import split_sentences, extract_keywords, clean_abstract, truncate
 
-# Singleton BERT model
-_MODEL: Optional[SentenceTransformer] = None
-
-def _get_model() -> SentenceTransformer:
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    return _MODEL
+# Use the shared ONNX embedding service — no torch, no sentence_transformers
+from app.services.embedding_service import generate_embeddings
 
 
 # Data structures
@@ -225,13 +218,11 @@ def _build_corpus(docs: List[SourceDocument]) -> Tuple[List[str], List[SourceDoc
     return ref_sentences, ref_doc_map
 
 
-# Stage 4: Batched BERT encoding
+# Stage 4: Encoding via shared ONNX service
 
 def _encode(sentences: List[str]) -> np.ndarray:
-    return _get_model().encode(
-        sentences, batch_size=64, convert_to_numpy=True,
-        normalize_embeddings=True, show_progress_bar=False,
-    ).astype(np.float32)
+    """Encode sentences using the shared ONNX embedding service."""
+    return generate_embeddings(sentences)
 
 
 # Stage 5: Similarity + scoring
@@ -313,12 +304,12 @@ def result_to_json(result: AcademicCheckResult) -> dict:
     ]
     return {
         "plagiarism_percentage":  result.plagiarism_percentage,
-        "overall_similarity_pct": result.plagiarism_percentage,   # legacy alias
+        "overall_similarity_pct": result.plagiarism_percentage,
         "flagged":                result.flagged,
         "sources_checked":        result.sources_checked,
         "sentences_checked":      result.sentences_checked,
         "elapsed_seconds":        result.elapsed_seconds,
-        "matched_segments":       segments,                        # legacy alias
+        "matched_segments":       segments,
         "matches": [
             {
                 "input_sentence":   m.input_sentence,
