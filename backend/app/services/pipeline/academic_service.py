@@ -5,7 +5,7 @@ academic_service.py — EduCheck Multi-Source Academic Plagiarism Checker
   Stage 1 — Preprocessing      (utils.py)
   Stage 2 — Parallel retrieval (arXiv + OpenAlex + GitHub via asyncio)
   Stage 3 — Text processing    (split + clean retrieved content)
-  Stage 4 — Semantic similarity (all-MiniLM-L6-v2 via ONNX)
+  Stage 4 — Semantic similarity (all-MiniLM-L6-v2 via ONNX, batched)
   Stage 5 — Scoring            (flagged / total x 100)
 """
 
@@ -23,19 +23,23 @@ import aiohttp
 import numpy as np
 
 from .utils import split_sentences, extract_keywords, clean_abstract, truncate
-
-# Use the shared ONNX embedding service — no torch, no sentence_transformers
 from app.services.embedding_service import generate_embeddings
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+# Tune these down to stay under 512MB on Render free tier
+MAX_SOURCES       = 15   # cap total papers fetched
+MAX_REF_SENTENCES = 200  # cap reference corpus size
+ENCODE_BATCH      = 32   # sentences per ONNX batch
 
-# Data structures
+
+# ── Data structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class SourceDocument:
     title:  str
     text:   str
     url:    str
-    source: str           # "arXiv" | "OpenAlex" | "GitHub"
+    source: str
     year:   Optional[int] = None
 
 
@@ -63,9 +67,9 @@ class AcademicCheckResult:
 _HEADERS = {"User-Agent": "EduCheck-Academic-Checker/2.0 (educational plagiarism detection)"}
 
 
-# Stage 2a: arXiv
+# ── Stage 2a: arXiv ───────────────────────────────────────────────────────────
 
-async def _fetch_arxiv(session: aiohttp.ClientSession, query: str, limit: int = 5) -> List[SourceDocument]:
+async def _fetch_arxiv(session: aiohttp.ClientSession, query: str, limit: int = 3) -> List[SourceDocument]:
     url = "http://export.arxiv.org/api/query"
     params = {"search_query": f"all:{query}", "max_results": limit, "sortBy": "relevance"}
     docs: List[SourceDocument] = []
@@ -94,7 +98,7 @@ async def _fetch_arxiv(session: aiohttp.ClientSession, query: str, limit: int = 
     return docs
 
 
-# Stage 2b: OpenAlex
+# ── Stage 2b: OpenAlex ────────────────────────────────────────────────────────
 
 def _reconstruct_abstract(inv_idx: dict) -> str:
     if not inv_idx:
@@ -107,7 +111,7 @@ def _reconstruct_abstract(inv_idx: dict) -> str:
     return " ".join(w for _, w in pairs)
 
 
-async def _fetch_openalex(session: aiohttp.ClientSession, query: str, limit: int = 5) -> List[SourceDocument]:
+async def _fetch_openalex(session: aiohttp.ClientSession, query: str, limit: int = 3) -> List[SourceDocument]:
     url    = "https://api.openalex.org/works"
     params = {
         "search":   query,
@@ -140,9 +144,9 @@ async def _fetch_openalex(session: aiohttp.ClientSession, query: str, limit: int
     return docs
 
 
-# Stage 2c: GitHub
+# ── Stage 2c: GitHub ──────────────────────────────────────────────────────────
 
-async def _fetch_github(session: aiohttp.ClientSession, query: str, limit: int = 4) -> List[SourceDocument]:
+async def _fetch_github(session: aiohttp.ClientSession, query: str, limit: int = 2) -> List[SourceDocument]:
     url     = "https://api.github.com/search/repositories"
     params  = {"q": query, "sort": "stars", "order": "desc", "per_page": limit}
     headers = {**_HEADERS}
@@ -177,15 +181,17 @@ async def _fetch_github(session: aiohttp.ClientSession, query: str, limit: int =
     return docs
 
 
-# Stage 2: Parallel orchestrator
+# ── Stage 2: Parallel orchestrator ───────────────────────────────────────────
 
 async def _fetch_all_sources(keywords: List[str]) -> List[SourceDocument]:
+    # Use only top 3 keywords to limit API calls and corpus size
+    top_keywords = keywords[:3]
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for kw in keywords:
-            tasks.append(_fetch_arxiv(session, kw, limit=4))
-            tasks.append(_fetch_openalex(session, kw, limit=4))
-            tasks.append(_fetch_github(session, kw, limit=3))
+        for kw in top_keywords:
+            tasks.append(_fetch_arxiv(session, kw, limit=3))
+            tasks.append(_fetch_openalex(session, kw, limit=3))
+            tasks.append(_fetch_github(session, kw, limit=2))
         batches = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen: set = set()
@@ -194,6 +200,8 @@ async def _fetch_all_sources(keywords: List[str]) -> List[SourceDocument]:
         if isinstance(batch, Exception):
             continue
         for doc in batch:
+            if len(docs) >= MAX_SOURCES:
+                break
             key = hashlib.md5(doc.title.lower().encode()).hexdigest()
             if key not in seen:
                 seen.add(key)
@@ -206,26 +214,35 @@ async def _fetch_all_sources(keywords: List[str]) -> List[SourceDocument]:
     return docs
 
 
-# Stage 3: Build reference corpus
+# ── Stage 3: Build reference corpus ──────────────────────────────────────────
 
 def _build_corpus(docs: List[SourceDocument]) -> Tuple[List[str], List[SourceDocument]]:
     ref_sentences: List[str] = []
     ref_doc_map: List[SourceDocument] = []
     for doc in docs:
-        for sent in split_sentences(truncate(doc.text, 3000)):
+        for sent in split_sentences(truncate(doc.text, 1000)):  # shorter truncation
+            if len(ref_sentences) >= MAX_REF_SENTENCES:
+                break
             ref_sentences.append(sent)
             ref_doc_map.append(doc)
+        if len(ref_sentences) >= MAX_REF_SENTENCES:
+            break
     return ref_sentences, ref_doc_map
 
 
-# Stage 4: Encoding via shared ONNX service
+# ── Stage 4: Batched encoding ─────────────────────────────────────────────────
 
-def _encode(sentences: List[str]) -> np.ndarray:
-    """Encode sentences using the shared ONNX embedding service."""
-    return generate_embeddings(sentences)
+def _encode_batched(sentences: List[str], batch_size: int = ENCODE_BATCH) -> np.ndarray:
+    """Encode in small batches to keep peak memory flat."""
+    if not sentences:
+        return np.empty((0, 384), dtype="float32")
+    parts = []
+    for i in range(0, len(sentences), batch_size):
+        parts.append(generate_embeddings(sentences[i : i + batch_size]))
+    return np.vstack(parts)
 
 
-# Stage 5: Similarity + scoring
+# ── Stage 5: Memory-efficient similarity + scoring ───────────────────────────
 
 def _compute_matches(
     submission_text: str,
@@ -237,29 +254,39 @@ def _compute_matches(
     if not sub_sentences or not ref_sentences:
         return [], len(sub_sentences) if sub_sentences else 0
 
-    sub_emb    = _encode(sub_sentences)
-    ref_emb    = _encode(ref_sentences)
-    sim_matrix = sub_emb @ ref_emb.T        # (N_sub x N_ref) cosine
+    # Encode reference corpus once
+    ref_emb = _encode_batched(ref_sentences)
 
     matches: List[MatchResult] = []
-    for i, sub_sent in enumerate(sub_sentences):
-        best_j     = int(np.argmax(sim_matrix[i]))
-        best_score = float(sim_matrix[i][best_j])
-        if best_score >= threshold:
-            doc = ref_doc_map[best_j]
-            matches.append(MatchResult(
-                input_sentence   = sub_sent,
-                matched_sentence = ref_sentences[best_j],
-                source           = doc.source,
-                similarity       = round(best_score, 4),
-                similarity_pct   = round(best_score * 100, 1),
-                title            = doc.title,
-                url              = doc.url,
-            ))
+
+    # Encode and score submission sentences one batch at a time
+    # so we never hold sub_emb @ ref_emb for the full matrix simultaneously
+    for i in range(0, len(sub_sentences), ENCODE_BATCH):
+        batch_sents = sub_sentences[i : i + ENCODE_BATCH]
+        batch_emb   = _encode_batched(batch_sents, batch_size=ENCODE_BATCH)
+        sim_block   = batch_emb @ ref_emb.T   # (batch, N_ref) — small slice only
+
+        for j, sub_sent in enumerate(batch_sents):
+            best_j     = int(np.argmax(sim_block[j]))
+            best_score = float(sim_block[j][best_j])
+            if best_score >= threshold:
+                doc = ref_doc_map[best_j]
+                matches.append(MatchResult(
+                    input_sentence   = sub_sent,
+                    matched_sentence = ref_sentences[best_j],
+                    source           = doc.source,
+                    similarity       = round(best_score, 4),
+                    similarity_pct   = round(best_score * 100, 1),
+                    title            = doc.title,
+                    url              = doc.url,
+                ))
+
+        del sim_block, batch_emb  # free immediately after each block
+
     return matches, len(sub_sentences)
 
 
-# Public entry point
+# ── Public entry point ────────────────────────────────────────────────────────
 
 async def check_academic_plagiarism(
     submission_text: str,
@@ -289,7 +316,7 @@ async def check_academic_plagiarism(
     )
 
 
-# JSON serialiser
+# ── JSON serialiser ───────────────────────────────────────────────────────────
 
 def result_to_json(result: AcademicCheckResult) -> dict:
     segments = [
